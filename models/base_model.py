@@ -1,16 +1,14 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from torch.nn.utils import weight_norm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Casual_GLU(nn.Module):
     """
-    GLU
+    GLU with tanh, and residual connection
     """
     def __init__(self, in_channels, out_channels, timeblock_padding,  Linear_TCN_layers=2,  dropout=0.3, kernel_size=2, start_dilation=1):
         super(Casual_GLU, self).__init__()
@@ -19,22 +17,24 @@ class Casual_GLU(nn.Module):
         self.timeblock_padding = timeblock_padding
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.TCN_l1 = TCN_L(in_dim=in_channels,out_dim=out_channels,
+        # The three TCN are identical
+        # filter, gate, residual
+        self.TCN_f = TCN_L(in_dim=in_channels,out_dim=out_channels,
                             kernel_size=kernel_size,layers=Linear_TCN_layers,timeblock_padding=timeblock_padding, dilation = start_dilation) 
-        self.TCN_l2 = TCN_L(in_dim=in_channels,out_dim=out_channels,
+        self.TCN_g = TCN_L(in_dim=in_channels,out_dim=out_channels,
                             kernel_size=kernel_size,layers=Linear_TCN_layers,timeblock_padding=timeblock_padding, dilation = start_dilation)
-        self.TCN_l3 = TCN_L(in_dim=in_channels,out_dim=out_channels,
+        self.TCN_r = TCN_L(in_dim=in_channels,out_dim=out_channels,
                             kernel_size=kernel_size,layers=Linear_TCN_layers,timeblock_padding=timeblock_padding, dilation = start_dilation)
 
     def forward(self, X):
 
-        res = self.TCN_l3(X)
-        out = torch.tanh(self.TCN_l1(X)) * torch.sigmoid(self.TCN_l2(X))
-        #out = self.TCN_l1(X) * torch.sigmoid(self.TCN_l2(X))       
+        res = self.TCN_r(X)
+        out = torch.tanh(self.TCN_f(X)) * torch.sigmoid(self.TCN_g(X))
+        #out = self.TCN_f(X) * torch.sigmoid(self.TCN_g(X))       
         out = F.dropout(out, self.dropout, training=self.training) 
         out = F.relu(out + res)
         #out = F.relu(out)
-        # out = F.dropout(self.TCN_l1(X))
+        # out = F.dropout(self.TCN_f(X))
         # out = F.relu(out)
         return out
 
@@ -42,7 +42,7 @@ class Casual_GLU(nn.Module):
 class TCN_L(nn.Module):
     def __init__(self, in_dim=1,out_dim=16, kernel_size=2,layers=2,timeblock_padding=True, dilation = 1):
         super(TCN_L, self).__init__()
-        self.layers = layers  # 1
+        self.layers = layers  # == 1
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.kernel_size = kernel_size
@@ -61,10 +61,10 @@ class TCN_L(nn.Module):
                                                    out_channels=out_dim,
                                                    kernel_size=(1,kernel_size),dilation=new_dilation)))
                 new_dilation =new_dilation* 2
-        self.receptive_field = np.power(2,layers)-1
+        self.receptive_field = (2 ** layers) - 1
                 
     def forward(self, input):
-
+        # input: (batch_size, in_dim, num_nodes, seq_len) (B, C, N, T')
         if self.in_dim == self.out_dim:
             filter = input
         else:
@@ -219,7 +219,7 @@ class STGM_Block(nn.Module):
                                             parallel_HLGCN_layers = parallel_HLGCN_layers)
         self.GLU_HLGCN_blocks = nn.ModuleList()
         for i in range(GLU_HLGCN_blocks_layers):
-            self.GLU_HLGCN_blocks.append(self.Causal_GLU_layer)
+            self.GLU_HLGCN_blocks.append(self.Causal_GLU_layer)  # These layers are shared!
             self.GLU_HLGCN_blocks.append(self.HLGCN_block_layer)
 
         self.skipConv = TCN_L(in_dim=in_channels,out_dim=spatial_channels,kernel_size=TimeBlock_kernel,
@@ -228,15 +228,17 @@ class STGM_Block(nn.Module):
         self.batch_norm = nn.BatchNorm2d(num_nodes)
         
     def forward(self, X, Lfilter, Hfilter):
+        """Parameters
+        X : (B, C, N, T') T' here is the length of the time series + node/position embedding, i.e. T + 2"""
         res = self.skipConv(X)
         out = X
         skip_list = []
         for i in range(self.GLU_HLGCN_blocks_layers):
-            out = self.GLU_HLGCN_blocks[i*2](out)
-            skip_list.append(out)
-            out = self.GLU_HLGCN_blocks[i*2+1](out,Lfilter, Hfilter)
+            out = self.GLU_HLGCN_blocks[i*2](out)  # even layers are a shared `Causal_GLU_layer`
+            skip_list.append(out)  # raw skip outputs
+            out = self.GLU_HLGCN_blocks[i*2+1](out,Lfilter, Hfilter)  # odd layers are a shared `HLGCN_block_layer` (LPGCN) layer
             out = self.dropout(out)
-        res = res[:,:,:,res.shape[3]-out.shape[3]:res.shape[3]]
+        res = res[:,:,:,res.shape[3]-out.shape[3]:res.shape[3]]  # cut, to make sure the residual connection has the same shape as the output
         
         out = self.batch_norm((res + out).permute(0,2,1,3)).permute(0,2,1,3)
         return out, skip_list
@@ -288,21 +290,15 @@ class HLGCN(nn.Module):
         self.start_conv =  weight_norm(nn.Conv2d(in_channels=num_features, out_channels=lhgcn_out_dim, kernel_size=(1,1)))
 
         for i in range(self.STGM_block_layers):
+            self.STGM_blocks.append(STGM_Block(in_channels=lhgcn_out_dim, out_channels=glu_out_dim,
+                                                spatial_channels=lhgcn_out_dim, num_nodes=num_nodes, 
+                                                dropout_rate = dropout_rate,
+                                                TimeBlock_kernel = TimeBlock_kernel, GLU_HLGCN_blocks_layers=self.GLU_HLGCN_blocks_layers,
+                                                parallel_HLGCN_layers=HLfilter_layers, GLU_Linear_TCN_layers=self.GLU_Linear_TCN_layers,
+                                                timeblock_padding=self.timeblock_padding, GLU_start_dilation=GLU_start_dilation))
             if i==0:
-                self.STGM_blocks.append(STGM_Block(in_channels=lhgcn_out_dim, out_channels=glu_out_dim,
-                                 spatial_channels=lhgcn_out_dim, num_nodes=num_nodes, 
-                                 dropout_rate = dropout_rate,
-                                 TimeBlock_kernel = TimeBlock_kernel, GLU_HLGCN_blocks_layers=self.GLU_HLGCN_blocks_layers,
-                                 parallel_HLGCN_layers=HLfilter_layers, GLU_Linear_TCN_layers=self.GLU_Linear_TCN_layers,
-                                timeblock_padding=self.timeblock_padding, GLU_start_dilation=GLU_start_dilation))                
                 self.tcn.append(TemporalConvNet(num_inputs=lhgcn_out_dim, num_channels=[lhgcn_out_dim,lhgcn_out_dim,lhgcn_out_dim,lhgcn_out_dim]))
             else:
-                self.STGM_blocks.append(STGM_Block(in_channels=lhgcn_out_dim, out_channels=glu_out_dim,
-                                 spatial_channels=lhgcn_out_dim, num_nodes=num_nodes, 
-                                 dropout_rate = dropout_rate,
-                                 TimeBlock_kernel = TimeBlock_kernel,  GLU_HLGCN_blocks_layers=self.GLU_HLGCN_blocks_layers,
-                                 parallel_HLGCN_layers=HLfilter_layers, GLU_Linear_TCN_layers=self.GLU_Linear_TCN_layers,
-                                 timeblock_padding=self.timeblock_padding, GLU_start_dilation=GLU_start_dilation))
                 self.tcn.append(TemporalConvNet(num_inputs=lhgcn_out_dim, num_channels=[lhgcn_out_dim,lhgcn_out_dim]))
             GLU_start_dilation *= dilation_exponential
   
@@ -334,36 +330,44 @@ class HLGCN(nn.Module):
 
 
     def forward(self, X, Graph_adj, position_embed):
-        
-        X = X.permute(0, 2, 1) 
-        X = torch.unsqueeze(X, dim=1)
+        """Parameters
+        X : input tensor with shape (B, T, N)
+        position_embed : the position embedding from previous iteration"""
+        X = X.permute(0, 2, 1)         # (B, N, T)
+        X = torch.unsqueeze(X, dim=1)  # (B, 1, N, T)
         Lfilter, Hfilter, adj  = self.HLfilter_construct_module(Graph_adj)
         skip=[]
         stgmskip_cach=[]      
-        out1 = self.start_conv(X)  
-        out1 = torch.cat([out1,position_embed],dim=3)
+        out1 = self.start_conv(X)  # 1*1 convolution with weight_norm, to increase the number of channels/features
+
+        out1 = torch.cat([out1,position_embed],dim=3)  # Concatenate the position embedding after the time dimension
 
         for i in range(self.STGM_block_layers):
+            # Skip output. Ignore concatted position embedding, then TCN
             skip.append(self.tcn[i](out1[:,:,:,:out1.shape[3] - self.position_emb_dim]))
-            #skip.append(out1[:,:,:,:out1.shape[3] - self.position_emb_dim])
+                #skip.append(out1[:,:,:,:out1.shape[3] - self.position_emb_dim])
+            
             out1, stgm_skip = self.STGM_blocks[i](out1, Lfilter, Hfilter)
             for i in range(self.GLU_HLGCN_blocks_layers):
+                # Take out skip connection from each GLU_HLGCN_blocks ('STBlock' in the paper)
                 stgmskip_cach.append(stgm_skip[i][:,:,:,:stgm_skip[i].shape[3] - self.position_emb_dim])
 
-        Bgraph = out1[:,:,:,out1.shape[3] - self.position_emb_dim:out1.shape[3]]
-        out1 = out1[:,:,:,:out1.shape[3] - self.position_emb_dim]
+        # Position embedding, split from the output of the last STGM block
+        Bgraph = out1[:,:,:, out1.shape[3] - self.position_emb_dim:out1.shape[3]]
+        out1 =   out1[:,:,:, :out1.shape[3] - self.position_emb_dim]
 
         if self.timeblock_padding==False:
             for i in range(self.STGM_block_layers):
-                skip[i] = skip[i][:,:,:,skip[i].shape[3]-out1.shape[3]:]
+                skip[i] = skip[i][:,:,:,skip[i].shape[3]-out1.shape[3]:]  # Cut the skip connection to the same length as the output
             for i in range(self.STGM_block_layers* self.GLU_HLGCN_blocks_layers):
                 stgmskip_cach[i] = stgmskip_cach[i][:,:,:,stgmskip_cach[i].shape[3]-out1.shape[3]:]
 
+        # Output layer
         out_skip = []
         if self.usespace_skip:
             out_skip.extend(skip)
-        if self.usetime_skip:
-            out_skip.extend(stgmskip_cach)
+        if self.usetime_skip: # False. Not used in the paper.
+            out_skip.extend(stgmskip_cach)  # this skip comes after Causal GLU and before LPGCN
         for i in range(len(out_skip)):
             out1 = torch.cat([out_skip[i], out1], dim = 1) 
 

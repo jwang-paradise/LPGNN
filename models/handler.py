@@ -1,14 +1,13 @@
 import json
 from data_loader.forecast_dataloader import ForecastDataset, de_normalized
 from models.base_model import HLGCN
-from utils.utils import *
+# from utils.utils import graphshow, position_show
 import torch
 import torch.nn as nn
 import torch.utils.data as torch_data
 import numpy as np
 import time
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import utils.math_utils 
 from utils.math_utils import evaluate
 from sklearn.neighbors import kneighbors_graph
@@ -113,7 +112,7 @@ def validate(model, position_embed, adj_mx, dataloader, device, normalize_method
 
 
 def train(train_data, valid_data, test_data, args, result_file):
-    # train_data:numpy [3499,140]
+    # train_data:numpy [3499,140]  # [time, node]
     node_cnt = train_data.shape[1]
     window_size = args.window_size + args.position_emb_dim
     model = HLGCN(node_cnt, args.input_dim, window_size, args.horizon, args.dropout_rate, args.HLfilter_layers,
@@ -162,7 +161,7 @@ def train(train_data, valid_data, test_data, args, result_file):
 
     k = args.knn
     knn_metric = 'cosine'
-    g = kneighbors_graph(train_feas[100:2100,:].T, k, metric=knn_metric)
+    g = kneighbors_graph(train_feas[100:2100,:].T, k, metric=knn_metric) # use 2000 time steps to build the graph
     g = np.array(g.todense(), dtype=np.float32)
     adj_mx = torch.Tensor(g).to(device)
         
@@ -221,6 +220,8 @@ def train(train_data, valid_data, test_data, args, result_file):
     valid_mape = []
     test_mae = []
     train_graph = 0
+
+    # Initialize the position embedding
     # position_embd = torch.zeros(args.batch_size, args.lhgcn_out_dim, args.num_nodes, args.position_emb_dim).to(device)    
     position_embd = torch.ones(args.batch_size, args.lhgcn_out_dim, args.num_nodes, args.position_emb_dim).to(device)
     #position_embd = torch.rand((args.num_nodes, args.position_emb_dim)).to(device)
@@ -241,20 +242,22 @@ def train(train_data, valid_data, test_data, args, result_file):
         activeF = nn.ReLU6()
         activeT = nn.Tanh()
         activeR = nn.ReLU()
-        mask = torch.eye(args.num_nodes, args.num_nodes).bool().to(device)       
+        mask = torch.eye(args.num_nodes, args.num_nodes).bool().to(device)  # identity matrix
 
+        # `graph_learning_metric` is set to 1 for all traffic datasets
         if args.graph_learning_metric == 0:
+            # Similar node embedding method to MTGNN. But one emb matrix instead of two.
             Graph_adj = activeR(activeT(torch.mm(position_embd,position_embd.t())-torch.mm(position_embd.t(),position_embd)))
-            Graph_adj = torch.where(Graph_adj <args.rewiring_distance, 1.0, 0.0)
-            Graph_adj.masked_fill_(mask, 0)
+            Graph_adj = torch.where(Graph_adj < args.rewiring_distance, 1.0, 0.0)
+            Graph_adj.masked_fill_(mask, 0)  # Set diagonal to zero
         elif args.graph_learning_metric == 1:
             Bgraph = torch.mean(position_embd,dim=1)
             Bgraph = torch.mean(Bgraph,dim=0)  
             Graph_adj = torch.norm(Bgraph[:,None]-Bgraph, dim=2,p=2)
             Graph_adj = activeF(Graph_adj)
-            Graph_adj = torch.where(Graph_adj < args.rewiring_distance, 1.0, 0.0)
-            Graph_adj.masked_fill_(adj_mx.bool(), 1)
-            Graph_adj.masked_fill_(mask, 0)
+            Graph_adj = torch.where(Graph_adj < args.rewiring_distance, 1.0, 0.0) # Eq.16  0-1 binarization/thresholding
+            Graph_adj.masked_fill_(adj_mx.bool(), 1)  # Eq.17  Add prior graph (from kNN)
+            Graph_adj.masked_fill_(mask, 0)  # Set diagonal to zero. Remove self-loop.
 
         for i, (inputs, target) in enumerate(train_loader):
         
@@ -264,6 +267,7 @@ def train(train_data, valid_data, test_data, args, result_file):
             model.zero_grad()
             forecast, graph ,position_embd_learned = model(inputs, Graph_adj, position_embd)
 
+            # Graph learning regularization?
             if label == 'without_regularization':  # or label == 'predictor':
                 loss = forecast_loss(forecast, target)
             else:
@@ -282,8 +286,8 @@ def train(train_data, valid_data, test_data, args, result_file):
             losses.append(loss.item())
             graphedge.append(graph_edge)
 
-        if args.graph_save:
-            graphshow(graph, epoch, result_file, 0.04)
+        # if args.graph_save:
+        #     graphshow(graph, epoch, result_file, 0.04)
         if args.model_save:
             print('model saved!!!')
             save_model(model, position_embd_learned, result_file, epoch)  

@@ -1,12 +1,10 @@
 import os
 import torch
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from datetime import datetime
 import configparser
 from models.handler import train, test
 import argparse
 import pandas as pd
-import numpy as np
 
 DATASET = 'PEMS08'
 HORIZON = '12'

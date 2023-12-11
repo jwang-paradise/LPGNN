@@ -218,11 +218,11 @@ class STGM_Block(nn.Module):
         self.HLGCN_block_layer = HLGCN_Block(node_num = num_nodes, in_channels = out_channels, out_channels = spatial_channels, dropout_rate = dropout_rate,
                                             parallel_HLGCN_layers = parallel_HLGCN_layers)
         self.GLU_HLGCN_blocks = nn.ModuleList()
-        for i in range(GLU_HLGCN_blocks_layers):
-            self.GLU_HLGCN_blocks.append(self.Causal_GLU_layer)  # These layers are shared!
+        for i in range(self.GLU_HLGCN_blocks_layers):  # == 1 layer
+            self.GLU_HLGCN_blocks.append(self.Causal_GLU_layer)  # These layers are SHARED within each STGM block!
             self.GLU_HLGCN_blocks.append(self.HLGCN_block_layer)
 
-        self.skipConv = TCN_L(in_dim=in_channels,out_dim=spatial_channels,kernel_size=TimeBlock_kernel,
+        self.resConv = TCN_L(in_dim=in_channels,out_dim=spatial_channels,kernel_size=TimeBlock_kernel,
                                 layers=GLU_Linear_TCN_layers,timeblock_padding=timeblock_padding)
         self.dropout = nn.Dropout(dropout_rate, inplace=True)
         self.batch_norm = nn.BatchNorm2d(num_nodes)
@@ -230,21 +230,21 @@ class STGM_Block(nn.Module):
     def forward(self, X, Lfilter, Hfilter):
         """Parameters
         X : (B, C, N, T') T' here is the length of the time series + node/position embedding, i.e. T + 2"""
-        res = self.skipConv(X)
+        res = self.resConv(X)
         out = X
         skip_list = []
-        for i in range(self.GLU_HLGCN_blocks_layers):
-            out = self.GLU_HLGCN_blocks[i*2](out)  # even layers are a shared `Causal_GLU_layer`
+        for i in range(self.GLU_HLGCN_blocks_layers): 
+            out = self.GLU_HLGCN_blocks[i*2](out)  # even layers are a SHARED `Causal_GLU_layer`
             skip_list.append(out)  # raw skip outputs
-            out = self.GLU_HLGCN_blocks[i*2+1](out,Lfilter, Hfilter)  # odd layers are a shared `HLGCN_block_layer` (LPGCN) layer
+            out = self.GLU_HLGCN_blocks[i*2+1](out,Lfilter, Hfilter)  # odd layers are a SHARED `HLGCN_block_layer` (LPGCN) layer
             out = self.dropout(out)
         res = res[:,:,:,res.shape[3]-out.shape[3]:res.shape[3]]  # cut, to make sure the residual connection has the same shape as the output
         
-        out = self.batch_norm((res + out).permute(0,2,1,3)).permute(0,2,1,3)
+        out = self.batch_norm((res + out).permute(0,2,1,3)).permute(0,2,1,3)  # Add residual and batch norm
         return out, skip_list
 
-def get_laplacian_matrix(graph, normalize=True):
-    if normalize:
+def get_laplacian_matrix(graph, sym_normalize=True):
+    if sym_normalize:
         D = torch.diag(1/torch.sqrt(torch.sum(graph, dim=1)))
         D = torch.where(torch.isinf(D), torch.zeros(D.shape).to(device), D)
         L = torch.eye(graph.size(0), device=graph.device, dtype=graph.dtype) - torch.mm(torch.mm(D, graph), D)  
@@ -263,7 +263,7 @@ class HLfilter_construct(nn.Module):
 
     def forward(self, Graph_adj):
         adj = Graph_adj
-        L, A_hat = get_laplacian_matrix(adj, normalize=True)
+        L, A_hat = get_laplacian_matrix(adj, sym_normalize=True)
         Lfilter = torch.eye(L.size(0), device=L.device, dtype=L.dtype) - L
         Hfilter = torch.eye(L.size(0), device=L.device, dtype=L.dtype) + L
         return Lfilter, Hfilter, adj
@@ -319,7 +319,7 @@ class HLGCN(nn.Module):
         if self.timeblock_padding:
             last_fc_unit = end_fc_in_dim*(num_timesteps_input - position_emb_dim)
 
-        self.fc = nn.Sequential(
+        self.output_layer = nn.Sequential(
             nn.ReLU(),
             nn.Linear(int(last_fc_unit), int(num_timesteps_output * 2 )),   
             nn.ReLU(),
@@ -362,7 +362,7 @@ class HLGCN(nn.Module):
             for i in range(self.STGM_block_layers* self.GLU_HLGCN_blocks_layers):
                 stgmskip_cach[i] = stgmskip_cach[i][:,:,:,stgmskip_cach[i].shape[3]-out1.shape[3]:]
 
-        # Output layer
+        # Add additional skip connections as final output
         out_skip = []
         if self.usespace_skip:
             out_skip.extend(skip)
@@ -371,10 +371,11 @@ class HLGCN(nn.Module):
         for i in range(len(out_skip)):
             out1 = torch.cat([out_skip[i], out1], dim = 1) 
 
+        # Output layer
         out1 = self.last_temporal(out1).permute(0,2,1,3)
         out1 = out1.reshape((out1.shape[0], out1.shape[1], -1))
 
-        out1 = self.fc(out1)      
+        out1 = self.output_layer(out1)      
         return out1.permute(0, 2, 1), adj, Bgraph
 
 

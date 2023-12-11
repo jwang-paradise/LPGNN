@@ -4,6 +4,7 @@ from models.base_model import HLGCN
 # from utils.utils import graphshow, position_show
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data as torch_data
 import numpy as np
 import time
@@ -163,7 +164,7 @@ def train(train_data, valid_data, test_data, args, result_file):
     knn_metric = 'cosine'
     g = kneighbors_graph(train_feas[100:2100,:].T, k, metric=knn_metric) # use 2000 time steps to build the graph
     g = np.array(g.todense(), dtype=np.float32)
-    adj_mx = torch.Tensor(g).to(device)
+    knn_adj_mat = torch.Tensor(g).to(device)
         
     if args.optimizer == 'RMSProp':
         my_optim = torch.optim.RMSprop(params=model.parameters(), lr=args.lr, eps=1e-08)
@@ -239,24 +240,24 @@ def train(train_data, valid_data, test_data, args, result_file):
         else:
             label = 'without_regularization'
 
-        activeF = nn.ReLU6()
-        activeT = nn.Tanh()
-        activeR = nn.ReLU()
+        # activeF = nn.ReLU6()
+        # activeT = nn.Tanh()
+        # activeR = nn.ReLU()
         mask = torch.eye(args.num_nodes, args.num_nodes).bool().to(device)  # identity matrix
 
         # `graph_learning_metric` is set to 1 for all traffic datasets
         if args.graph_learning_metric == 0:
             # Similar node embedding method to MTGNN. But one emb matrix instead of two.
-            Graph_adj = activeR(activeT(torch.mm(position_embd,position_embd.t())-torch.mm(position_embd.t(),position_embd)))
+            Graph_adj = F.relu(F.tanh(torch.mm(position_embd,position_embd.t())-torch.mm(position_embd.t(),position_embd)))
             Graph_adj = torch.where(Graph_adj < args.rewiring_distance, 1.0, 0.0)
             Graph_adj.masked_fill_(mask, 0)  # Set diagonal to zero
         elif args.graph_learning_metric == 1:
             Bgraph = torch.mean(position_embd,dim=1)
             Bgraph = torch.mean(Bgraph,dim=0)  
             Graph_adj = torch.norm(Bgraph[:,None]-Bgraph, dim=2,p=2)
-            Graph_adj = activeF(Graph_adj)
+            Graph_adj = F.relu6(Graph_adj) #activeF(Graph_adj)
             Graph_adj = torch.where(Graph_adj < args.rewiring_distance, 1.0, 0.0) # Eq.16  0-1 binarization/thresholding
-            Graph_adj.masked_fill_(adj_mx.bool(), 1)  # Eq.17  Add prior graph (from kNN)
+            Graph_adj.masked_fill_(knn_adj_mat.bool(), 1)  # Eq.17  Add prior graph (from kNN)
             Graph_adj.masked_fill_(mask, 0)  # Set diagonal to zero. Remove self-loop.
 
         for i, (inputs, target) in enumerate(train_loader):
@@ -267,24 +268,29 @@ def train(train_data, valid_data, test_data, args, result_file):
             model.zero_grad()
             forecast, graph ,position_embd_learned = model(inputs, Graph_adj, position_embd)
 
-            # Graph learning regularization?
             if label == 'without_regularization':  # or label == 'predictor':
                 loss = forecast_loss(forecast, target)
             else:
-                loss_1 = forecast_loss(forecast, target)
+                loss_forecast = forecast_loss(forecast, target)
+
+                # Graph learning regularization (knn graph as ground truth)
+                # According to the configs, this is never used.
                 pred = torch.sigmoid(Graph_adj.view(Graph_adj.shape[0] * Graph_adj.shape[1])) # Another option: use softmax.
-                true_label = adj_mx.view(Graph_adj.shape[0] * Graph_adj.shape[1]).to(device)
+                true_label = knn_adj_mat.view(Graph_adj.shape[0] * Graph_adj.shape[1]).to(device)
                 compute_loss = torch.nn.BCELoss()
-                loss_g = compute_loss(pred, true_label)            
-                loss = loss_1 + args.regular_loss_ratio * loss_g
+                loss_graph = compute_loss(pred, true_label)  # graph loss
+                loss = loss_forecast + args.regular_loss_ratio * loss_graph
             cnt += 1
             loss.backward()
             my_optim.step()
+
+            # Statistics
             loss_total += float(loss)
             #print(graph)
             graph_edge = torch.sum(torch.abs(graph)).cpu().detach().numpy()
             losses.append(loss.item())
             graphedge.append(graph_edge)
+        # End of epoch (done iterating all samples)
 
         # if args.graph_save:
         #     graphshow(graph, epoch, result_file, 0.04)
@@ -325,14 +331,14 @@ def train(train_data, valid_data, test_data, args, result_file):
                          args.norm_column_wise, result_file=None)
 
         if train_graph == 0:
-            position_embd = position_embd_learned.detach()
+            position_embd = position_embd_learned.detach()  # use learned pos emb for next epoch
         elif train_graph == 1:
             print('------------------------------Read the best graph!------------------------------------')
             _, best_position_embd, Graph_adj = load_model(result_file)
-            position_embd = best_position_embd
+            position_embd = best_position_embd  # use the best, fixed pos emb for following epochs
             train_graph =2
             print('-----------------------------Start optimizing parameters!-----------------------------')
-        else:
+        else: # == 2
             position_embd = best_position_embd
             train_graph =2
 
